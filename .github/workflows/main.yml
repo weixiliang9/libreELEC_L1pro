@@ -3,109 +3,156 @@ name: Build LibreELEC for RK3328 L1Pro
 on:
   workflow_dispatch:
     inputs:
-      librelec_version:
-        description: 'LibreELEC Version'
+      le_periodic_version:
+        description: "Version and Periodic builds"
+        default: nightly
         required: true
-        default: '12.0'
-        type: string
-      kernel_version:
-        description: 'Kernel Version'
+        type: choice
+        options:
+          - nightly
+          - official
+      gitref_to_build:
+        description: "gitref tag or hash to build"
+        default: libreelec-12.0
         required: true
-        default: '6.6.y'
         type: string
 
 env:
-  PROJECT: "Rockchip"
-  ARCH: "aarch64"
-  DEVICE_TREE: "rk3328-l1pro-1296mhz"
+  clean_le: no_clean_le
+  debug: debug
+  ephemeral: ephemeral
+  upload: upload
 
 jobs:
-  build:
+  setup_custom_device_tree:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
-    
+    name: Setup Custom Device Tree
+    outputs:
+      dts_setup_complete: ${{ steps.setup.outputs.dts_setup_complete }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Checkout repository with device tree
+        uses: actions/checkout@v5
         with:
-          submodules: recursive
+          fetch-depth: 1
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Build LibreELEC
+      - name: Verify device tree files
+        id: verify_dts
         run: |
-          LIBREELEC_VERSION="${{ github.event.inputs.librelec_version }}"
-          KERNEL_VERSION="${{ github.event.inputs.kernel_version }}"
-          
-          docker run --rm \
-            --privileged \
-            -v $(pwd):/build \
-            -w /build \
-            libreelec/build-env:latest /bin/bash -c "
-            set -e
-            
-            echo '=== Cloning LibreELEC ==='
-            if [ ! -d LibreELEC.tv ]; then
-              git clone https://github.com/LibreELEC/LibreELEC.tv
-            fi
-            
-            cd LibreELEC.tv
-            git checkout \$LIBREELEC_VERSION
-            
-            echo '=== Setting up build environment ==='
-            ./scripts/setup
-            
-            echo '=== Integrating custom device tree ==='
-            # 查找内核目录
-            KERNEL_DIR=\$(find projects/$PROJECT -name 'linux-*' -type d | head -1)
-            if [ -z \"\$KERNEL_DIR\" ]; then
-              echo 'Kernel directory not found!'
-              exit 1
-            fi
-            
-            echo \"Using kernel directory: \$KERNEL_DIR\"
-            
-            # 复制设备树到正确位置
-            DTS_DEST=\"\$KERNEL_DIR/arch/arm64/boot/dts/rockchip/\"
-            if [ -d \"\$DTS_DEST\" ]; then
-              cp /build/rk3328-l1pro-1296mhz.dts \"\$DTS_DEST\"
-              if [ -f /build/rk3328.dtsi ]; then
-                cp /build/rk3328.dtsi \"\$DTS_DEST\"
-              fi
-              
-              # 添加到设备树 Makefile
-              if [ -f \"\$DTS_DEST/Makefile\" ]; then
-                if ! grep -q \"rk3328-l1pro-1296mhz.dtb\" \"\$DTS_DEST/Makefile\"; then
-                  echo 'dtb-\\$(CONFIG_ARCH_ROCKCHIP) += rk3328-l1pro-1296mhz.dtb' >> \"\$DTS_DEST/Makefile\"
-                  echo 'Added rk3328-l1pro-1296mhz.dtb to Makefile'
-                fi
-              else
-                echo 'Warning: DTS Makefile not found at expected location'
-              fi
-            else
-              echo \"Error: DTS destination directory not found: \$DTS_DEST\"
-              exit 1
-            fi
-            
-            echo '=== Building image ==='
-            # 构建 Rockchip 镜像
-            PROJECT=Rockchip ARCH=aarch64 make image
-            
-            echo '=== Build completed ==='
-          "
+          if [ ! -f "rk3328-l1pro-1296mhz.dts" ]; then
+            echo "Error: rk3328-l1pro-1296mhz.dts not found!"
+            exit 1
+          fi
+          echo "Device tree files verified"
+          echo "dts_files_present=true" >> $GITHUB_OUTPUT
 
-      - name: Prepare artifacts
+      - name: Checkout LibreELEC source
+        uses: actions/checkout@v5
+        with:
+          repository: "LibreELEC/LibreELEC.tv"
+          ref: ${{ github.event.inputs.gitref_to_build || 'libreelec-12.0' }}
+          path: "LibreELEC.tv"
+
+      - name: Integrate custom device tree
+        id: setup
         run: |
           cd LibreELEC.tv
           
+          # 创建设备树包目录
+          mkdir -p projects/Rockchip/packages/device-tree/custom
+          
+          # 复制设备树文件
+          cp ../rk3328-l1pro-1296mhz.dts projects/Rockchip/packages/device-tree/custom/
+          if [ -f "../rk3328.dtsi" ]; then
+            cp ../rk3328.dtsi projects/Rockchip/packages/device-tree/custom/
+          fi
+          
+          # 创建设备树包配置
+          cat > projects/Rockchip/packages/device-tree/custom/package.mk << 'EOF'
+          PKG_NAME="custom-device-tree"
+          PKG_VERSION="1.0"
+          PKG_LICENSE="GPL"
+          PKG_SITE=""
+          PKG_URL=""
+          PKG_DEPENDS_TARGET="toolchain dtc"
+          PKG_LONGDESC="Custom device tree for RK3328 L1Pro"
+          
+          makeinstall_target() {
+            mkdir -p \$INSTALL/usr/share/bootloader
+            dtc -I dts -O dtb -o \$INSTALL/usr/share/bootloader/rk3328-l1pro-1296mhz.dtb rk3328-l1pro-1296mhz.dts
+          }
+          EOF
+          
+          # 添加到项目包列表
+          if ! grep -q "custom-device-tree" projects/Rockchip/options; then
+            echo "ADDITIONAL_PACKAGES+=\" custom-device-tree\"" >> projects/Rockchip/options
+          fi
+          
+          echo "Custom device tree integration completed"
+          echo "dts_setup_complete=true" >> $GITHUB_OUTPUT
+
+  build_rk3328_custom:
+    name: "RK3328 L1Pro Custom"
+    needs: setup_custom_device_tree
+    if: needs.setup_custom_device_tree.outputs.dts_setup_complete == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout LibreELEC source
+        uses: actions/checkout@v5
+        with:
+          repository: "LibreELEC/LibreELEC.tv"
+          ref: ${{ github.event.inputs.gitref_to_build || 'libreelec-12.0' }}
+          path: "LibreELEC.tv"
+
+      - name: Restore custom device tree setup
+        run: |
+          # 复用之前设置的设备树
+          cd LibreELEC.tv
+          mkdir -p projects/Rockchip/packages/device-tree/custom
+          cp ../rk3328-l1pro-1296mhz.dts projects/Rockchip/packages/device-tree/custom/
+          if [ -f "../rk3328.dtsi" ]; then
+            cp ../rk3328.dtsi projects/Rockchip/packages/device-tree/custom/
+          fi
+          
+          cat > projects/Rockchip/packages/device-tree/custom/package.mk << 'EOF'
+          PKG_NAME="custom-device-tree"
+          PKG_VERSION="1.0"
+          PKG_LICENSE="GPL"
+          PKG_SITE=""
+          PKG_URL=""
+          PKG_DEPENDS_TARGET="toolchain dtc"
+          PKG_LONGDESC="Custom device tree for RK3328 L1Pro"
+          
+          makeinstall_target() {
+            mkdir -p \$INSTALL/usr/share/bootloader
+            dtc -I dts -O dtb -o \$INSTALL/usr/share/bootloader/rk3328-l1pro-1296mhz.dtb rk3328-l1pro-1296mhz.dts
+          }
+          EOF
+          
+          echo "ADDITIONAL_PACKAGES+=\" custom-device-tree\"" >> projects/Rockchip/options
+
+      - name: Setup build environment
+        run: |
+          cd LibreELEC.tv
+          ./scripts/setup
+
+      - name: Build LibreELEC image
+        run: |
+          cd LibreELEC.tv
+          PROJECT=Rockchip \
+          ARCH=aarch64 \
+          DEVICE=RK3328 \
+          make image
+
+      - name: Find and rename built image
+        run: |
+          cd LibreELEC.tv
           # 查找生成的镜像文件
-          IMG_FILE=$(find target -name "LibreELEC-*.img.gz" -type f | head -1)
+          IMG_FILE=$(find target -name "LibreELEC-RK3328*.img.gz" -type f | head -1)
           if [ -z "$IMG_FILE" ]; then
-            echo "No .img.gz file found, checking for .img files..."
-            IMG_FILE=$(find target -name "LibreELEC-*.img" -type f | head -1)
+            echo "No image file found, checking for uncompressed images..."
+            IMG_FILE=$(find target -name "LibreELEC-RK3328*.img" -type f | head -1)
             if [ -n "$IMG_FILE" ]; then
-              echo "Compressing .img file..."
+              echo "Compressing image..."
               gzip "$IMG_FILE"
               IMG_FILE="${IMG_FILE}.gz"
             fi
@@ -113,28 +160,62 @@ jobs:
           
           if [ -z "$IMG_FILE" ]; then
             echo "Error: No built image found!"
-            find target -type f | head -20
+            find target -type f -name "*.img*" | head -10
             exit 1
           fi
           
-          # 创建有意义的文件名
-          VERSION=${IMG_FILE##*LibreELEC-}
-          VERSION=${VERSION%.img*}
-          cp "$IMG_FILE" "../LibreELEC-RK3328-L1Pro-${VERSION}.img.gz"
-          echo "Artifact: LibreELEC-RK3328-L1Pro-${VERSION}.img.gz"
+          # 重命名为自定义名称
+          CUSTOM_NAME="LibreELEC-RK3328-L1Pro-Custom-${GITHUB_RUN_NUMBER}.img.gz"
+          cp "$IMG_FILE" "../$CUSTOM_NAME"
+          echo "CUSTOM_IMAGE=$CUSTOM_NAME" >> $GITHUB_ENV
+          echo "Image prepared: $CUSTOM_NAME"
 
-      - name: Upload artifact
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: LibreELEC-RK3328-L1Pro
-          path: LibreELEC-RK3328-L1Pro-*.img.gz
+          name: LibreELEC-RK3328-L1Pro-Custom
+          path: LibreELEC-RK3328-L1Pro-Custom-*.img.gz
           retention-days: 30
 
-      - name: Show build info
+      - name: Create GitHub Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: LibreELEC-RK3328-L1Pro-Custom-*.img.gz
+          generate_release_notes: true
+
+  build_using_official_action:
+    name: "RK3328 Official Action Method"
+    needs: setup_custom_device_tree
+    if: needs.setup_custom_device_tree.outputs.dts_setup_complete == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Build using official LibreELEC action
+        uses: libreelec/actions/build@main
+        with:
+          version: "12.0"
+          project: "Rockchip"
+          device: "RK3328"
+          arch: "aarch64"
+          # 传递自定义参数
+          custom_packages: "custom-device-tree"
+          additional_options: "ADDITIONAL_PACKAGES+=\" custom-device-tree\""
+
+      - name: Rename and upload official build
         run: |
-          echo "=== Build Completed Successfully ==="
-          echo "LibreELEC Version: ${{ github.event.inputs.librelec_version }}"
-          echo "Kernel Version: ${{ github.event.inputs.kernel_version }}"
-          echo "Device: RK3328 L1Pro"
-          echo "Architecture: aarch64"
-          echo "Custom Device Tree: rk3328-l1pro-1296mhz.dts"
+          # 假设官方action输出的文件在特定位置
+          if [ -f "LibreELEC-RK3328*.img.gz" ]; then
+            cp LibreELEC-RK3328*.img.gz "LibreELEC-RK3328-L1Pro-Official-${GITHUB_RUN_NUMBER}.img.gz"
+          fi
+
+      - name: Upload official artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LibreELEC-RK3328-L1Pro-Official
+          path: LibreELEC-RK3328-L1Pro-Official-*.img.gz
+          retention-days: 30
